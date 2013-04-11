@@ -133,7 +133,7 @@ type ROnly = RD.ReaderT Sched IO
 
 newtype IVar a = IVar (IORef (IVarContents a))
 
-data IVarContents a = Full a | Empty | Blocked [a -> IO ()]
+data IVarContents a = Full a {-# UNPACK #-} !Task | Empty | Blocked [a -> Task -> IO ()]
 
 unsafeParIO :: IO a -> Par a 
 unsafeParIO iom = Par (lift$ lift iom)
@@ -248,18 +248,30 @@ runNewSessionAndWait name sched userComp = do
     -- Push the new session:
     _ <- modifyHotVar (sessions sched) (\ ls -> ((Session sid newFlag) : ls, ()))
 
-    let userComp' = do when dbg$ io$ do
-                           tid2 <- myThreadId
-                           printf " [%d %s] Starting Par computation on %s.\n" (no sched) (show tid2) name
-                       ans <- userComp
-                       -- This add-on to userComp will run only after userComp has completed successfully,
-                       -- but that does NOT guarantee that userComp-forked computations have terminated:
-                       io$ do when (dbglvl>=1) $ do
-                                tid3 <- myThreadId
-                                printf " [%d %s] Continuation for %s called, finishing it up (%d)...\n" (no sched) (show tid3) name sid
-                              writeIORef ref ans
-                              writeHotVarRaw newFlag True
-                              modifyHotVar (activeSessions sched) (\ set -> (S.delete sid set, ()))
+    -- Get (possible) parent task, in case we are recursing
+    ptid <- getTaskId
+    ntid <- createTask
+    when (not $ isTaskNull ptid) $ do
+      stopTask ptid
+      dependOnTask ptid ntid
+
+    let userComp' = do
+          when dbg$ io$ do
+            tid2 <- myThreadId
+            printf " [%d %s] Starting Par computation on %s.\n" (no sched) (show tid2) name
+
+          io$ startTask ntid
+          ans <- userComp
+          io$ stopTask ntid
+
+          -- This add-on to userComp will run only after userComp has completed successfully,
+          -- but that does NOT guarantee that userComp-forked computations have terminated:
+          io$ do when (dbglvl>=1) $ do
+                   tid3 <- myThreadId
+                   printf " [%d %s] Continuation for %s called, finishing it up (%d)...\n" (no sched) (show tid3) name sid
+                 writeIORef ref ans
+                 writeHotVarRaw newFlag True
+                 modifyHotVar (activeSessions sched) (\ set -> (S.delete sid set, ()))
         kont :: Word64 -> a -> ROnly ()
         kont n = trivialCont$ "("++name++", sid "++show sid++", round "++show n++")"
         loop :: Word64 -> ROnly ()
@@ -290,6 +302,11 @@ runNewSessionAndWait name sched userComp = do
         else error$ "Tried to pop the session stack and found we ("++show sid
                    ++") were not on the top! (instead "++show sid2++")"
                
+    -- Restore parent task, if any.
+    when (not $ isTaskNull ptid) $ do
+      dependOnTask ptid ntid
+      startTask ptid
+
     -- By returning here we ARE implicitly reengaging the scheduler, since we
     -- are already inside the rescheduleR loop on this thread
     -- (before runParIO was called in a nested fashion).
@@ -428,14 +445,28 @@ new  = io$ do r <- newIORef Empty
 -- | read the value in a @IVar@.  The 'get' can only return when the
 -- value has been written by a prior or parallel @put@ to the same
 -- @IVar@.
-get (IVar vr) =  do 
-  callCC $ \kont -> 
+get (IVar vr) =  do
+  callCC $ \kont ->
     do
        e  <- io$ readIORef vr
        case e of
-	  Full a -> return a
+	  Full a dtid -> do
+            tid <- io$ getTaskId
+            io$ dependOnTask tid dtid
+            return a
+
 	  _ -> do
+
+            -- Get current task, wrap continuation so it gets restored
+            -- appropriately
             sch <- RD.ask
+            tid <- io$ getTaskId
+            io$ stopTask tid
+            let kont' x dtid = pushWork sch $ do
+                  io$ dependOnTask tid dtid
+                  io$ startTask tid
+                  kont x
+
 #  ifdef DEBUG
             sn <- io$ makeStableName vr  -- Should probably do the MutVar inside...
             let resched = trace (" ["++ show (no sch) ++ "]  - Rescheduling on unavailable ivar "++show (hashStableName sn)++"!") 
@@ -446,9 +477,12 @@ get (IVar vr) =  do
             -- Because we continue on the same processor the Sched stays the same:
             -- TODO: Try NOT using monadic values as first class.  Check for performance effect:
 	    r <- io$ atomicModifyIORef vr $ \x -> case x of
-		      Empty      -> (Blocked [pushWork sch . kont], resched)
-		      Full a     -> (Full a, return a) -- kont is implicit here.
-		      Blocked ks -> (Blocked (pushWork sch . kont:ks), resched)
+		      Empty      -> (Blocked [kont'], resched)
+		      Full a dtid -> (x, do io$ dependOnTask tid dtid
+                                            io$ startTask tid
+                                            return a
+                                     ) -- kont is not needed here.
+		      Blocked ks -> (Blocked (kont':ks), resched)
 	    r
 
 -- | NOTE unsafePeek is NOT exposed directly through this module.  (So
@@ -459,8 +493,8 @@ unsafePeek :: IVar a -> Par (Maybe a)
 unsafePeek (IVar v) = do 
   e  <- io$ readIORef v
   case e of 
-    Full a -> return (Just a)
-    _      -> return Nothing
+    Full a _ -> return (Just a)
+    _        -> return Nothing
 
 ------------------------------------------------------------
 {-# INLINE put_ #-}
@@ -468,11 +502,12 @@ unsafePeek (IVar v) = do
 --   In this scheduler, puts immediately execute woken work in the current thread.
 put_ (IVar vr) !content = do
    sched <- RD.ask
-   ks <- io$ do 
+   tid <- io$ getTaskId
+   ks <- io$ do
       ks <- atomicModifyIORef vr $ \e -> case e of
-               Empty      -> (Full content, [])
-               Full _     -> error "multiple put"
-               Blocked ks -> (Full content, ks)
+               Empty      -> (Full content tid, [])
+               Full _ _   -> error "multiple put"
+               Blocked ks -> (Full content tid, ks)
 #ifdef DEBUG
       when (dbglvl >=  3) $ do 
          sn <- makeStableName vr
@@ -481,7 +516,7 @@ put_ (IVar vr) !content = do
          return ()
 #endif 
       return ks
-   wakeUp sched ks content   
+   wakeUp sched ks content tid
 
 -- | NOTE unsafeTryPut is NOT exposed directly through this module.  (So
 -- this module remains SAFE in the Safe Haskell sense.)  It can only
@@ -490,24 +525,25 @@ put_ (IVar vr) !content = do
 unsafeTryPut (IVar vr) !content = do
    -- Head strict rather than fully strict.
    sched <- RD.ask 
+   tid <- io$ getTaskId
    (ks,res) <- io$ do 
       pr <- atomicModifyIORef vr $ \e -> case e of
-		   Empty      -> (Full content, ([], content))
-		   Full x     -> (Full x, ([], x))
-		   Blocked ks -> (Full content, (ks, content))
+		   Empty      -> (Full content tid, ([], content))
+		   Full x _   -> (e,                ([], x))
+		   Blocked ks -> (Full content tid, (ks, content))
 #ifdef DEBUG
       sn <- makeStableName vr
       printf " [%d] unsafeTryPut: value %s in IVar %d.  Waking up %d continuations.\n" 
 	     (no sched) (show content) (hashStableName sn) (length (fst pr))
 #endif
       return pr
-   wakeUp sched ks content
+   wakeUp sched ks content tid
    return res
 
 -- | When an IVar is filled in, continuations wake up.
 {-# INLINE wakeUp #-}
-wakeUp :: Sched -> [a -> IO ()]-> a -> Par ()
-wakeUp _sched ks arg = loop ks
+wakeUp :: Sched -> [a -> Task -> IO ()] -> a -> Task -> Par ()
+wakeUp _sched ks arg tid = loop ks
  where
    loop [] = return ()
    loop (kont:rest) = do
@@ -532,13 +568,13 @@ wakeUp _sched ks arg = loop ks
        -- [2012.08.31] WARNING -- this serialzation CAN cause deadlock.
        -- This "optimization" should not be on the table.
        -- mapM_ ($arg) ks
-       do io$ kont arg
-          loop rest 
+       do io$ kont arg tid
+          loop rest
      return ()
 
-   pMap kont [] = io$ kont arg
+   pMap kont [] = io$ kont arg tid
    pMap kont (more:rest) =
-     do spawn_$ io$ kont arg
+     do spawn_$ io$ kont arg tid
         pMap more rest
 
    -- parchain [kont] = kont arg
@@ -546,25 +582,39 @@ wakeUp _sched ks arg = loop ks
    --                           parchain rest
                               
 
+wrapTask :: Task -> Par a -> Par a
+wrapTask tid code = do
+  io$ startTask tid
+  a <- code
+  io$ stopTask tid
+  return a
+
 ------------------------------------------------------------
 {-# INLINE fork #-}
 fork :: Par () -> Par ()
-fork task =
+fork task = do
+  -- Make new task, register origin
+  ptid <- io$ getTaskId
+  ntid <- io$ createTask
+  io$ dependOnTask ntid ptid
   -- Forking the "parent" means offering up the continuation of the
   -- fork rather than the task argument for stealing:
-  case _FORKPARENT of 
-    True -> do 
-      sched <- RD.ask   
+  case _FORKPARENT of
+    True -> do
+      io$ stopTask ptid
+
+      sched <- RD.ask
       callCC$ \parent -> do
          let wrapped = parent ()
          io$ pushWork sched wrapped
          -- Then execute the child task and return to the scheduler when it is complete:
-         task 
+         wrapTask ntid task
          -- If we get to this point we have finished the child task:
          longjmpSched -- We reschedule to pop the cont we pushed.
          -- TODO... OPTIMIZATION: we could also try the pop directly, and if it succeeds return normally....
          io$ printf " !!! ERROR: Should never reach this point #1\n"
 
+      io$ startTask ptid
       when dbg$ do 
        sched2 <- RD.ask 
        io$ printf "  -  called parent continuation... was on worker [%d] now on worker [%d]\n" (no sched) (no sched2)
@@ -573,8 +623,8 @@ fork task =
     False -> do 
       sch <- RD.ask
       when dbg$ io$ printf " [%d] forking task...\n" (no sch)
-      io$ pushWork sch task
    
+      io$ pushWork sch (wrapTask ntid task)
 -- This routine "longjmp"s to the scheduler, throwing out its own continuation.
 longjmpSched :: Par a
 -- longjmpSched = Par $ C.ContT rescheduleR
@@ -590,6 +640,13 @@ rescheduleR cnt kont = do
                        null <- R.nullQ (workpool mysched)
                        printf " [%d %s]  - Reschedule #%d... sessions %s, pool empty %s\n"
                               (no mysched) (show tid) cnt (show sess) (show null)
+
+  -- Should never be called with active task
+  task <- liftIO$ getTaskId
+  case isTaskNull task of
+    True -> return ()
+    False -> error "rescheduleR called with active task!"
+
   mtask  <- liftIO$ popWork mysched
   case mtask of
     Nothing -> do
