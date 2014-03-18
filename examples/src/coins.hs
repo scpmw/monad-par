@@ -11,6 +11,8 @@ import PARSCHED
 import Control.Monad.Par
 #endif
 
+import Debug.Trace
+
 -- Rough results, GHC 6.13: (val=777)
 --   V1 (SDM):             2.2s
 --   V2 (SDM):             2.7s
@@ -187,9 +189,9 @@ payN_par depth val ((c,q):coins)
 -- Competitive with Version 7.
 
 payN_mp :: Int -> Int -> [(Int,Int)] -> Int
-payN_mp depth val coins = 
-    runPar $ 
-        payN_mpM depth val coins  
+payN_mp depth val coins =
+    runPar $
+        payN_mpM depth val coins
 
 payN_mpM :: Int -> Int -> [(Int,Int)] -> Par Int
 payN_mpM 0     val coins  = return $ payN val coins
@@ -198,13 +200,12 @@ payN_mpM _     _   []     = return 0
 payN_mpM depth val ((c,q):coins)
   | c > val    = payN_mpM depth val coins
   | otherwise  = res
-                
+
   where
-    res = 
-            do lv <- spawn $ left
-               r <- right
-               l <- get lv
-               return (l + r)
+    res = do lv <- spawn $ left
+             r <- right
+             l <- get lv
+             return (l + r)
 
     left  = payN_mpM (if q == 1 then (depth-1) else depth) (val - c) coins'
     right = payN_mpM (depth-1) val coins
@@ -245,4 +246,3 @@ main = do
            6 -> print $ payN arg coins1
            7 -> print $ payN_par 4 arg coins1
            8 -> print $ payN_mp 4 arg coins1
-           

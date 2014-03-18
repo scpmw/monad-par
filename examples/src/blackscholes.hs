@@ -53,12 +53,12 @@ type FpType = Float
 
 -- This tuple contains the inputs for one invocation of our kernel
 data ParameterSet =  ParameterSet {
-	sptprice   :: FpType,
-	strike     :: FpType,
-	rate       :: FpType,
-	volatility :: FpType ,
-	otime      :: FpType,
-	otype      :: Bool
+        sptprice   :: FpType,
+        strike     :: FpType,
+        rate       :: FpType,
+        volatility :: FpType ,
+        otime      :: FpType,
+        otype      :: Bool
 } deriving Show
 
 data_init :: Array Int ParameterSet
@@ -74,19 +74,19 @@ inv_sqrt_2xPI = 0.39894228040143270286
 
 cndf :: FpType -> FpType
 cndf inputX = if sign then 1.0 - xLocal else xLocal
-  where 
+  where
     sign = inputX < 0.0
     inputX' = if sign then -inputX else inputX
-    
+
     -- Compute NPrimeX term common to both four & six decimal accuracy calcs
     xNPrimeofX = inv_sqrt_2xPI * exp(-0.5 * inputX * inputX);
 
-    xK2 = 1.0 / (0.2316419 * inputX + 1.0);    
+    xK2 = 1.0 / (0.2316419 * inputX + 1.0);
     xK2_2 = xK2   * xK2; -- Need all powers of xK2 from ^1 to ^5:
     xK2_3 = xK2_2 * xK2;
     xK2_4 = xK2_3 * xK2;
     xK2_5 = xK2_4 * xK2;
-    
+
     xLocal   = 1.0 - xLocal_1 * xNPrimeofX;
     xLocal_1 = xK2   *   0.319381530  + xLocal_2;
     xLocal_2 = xK2_2 * (-0.356563782) + xLocal_3 + xLocal_3' + xLocal_3'';
@@ -100,17 +100,17 @@ blkSchlsEqEuroNoDiv sptprice strike rate volatility time otype timet =
    if not otype
    then (sptprice * nofXd1) - (futureValueX * nofXd2)
    else let negNofXd1 = 1.0 - nofXd1
-	    negNofXd2 = 1.0 - nofXd2
-	in (futureValueX * negNofXd2) - (sptprice * negNofXd1)
- where 
-   logValues  = log( sptprice / strike )                
+            negNofXd2 = 1.0 - nofXd2
+        in (futureValueX * negNofXd2) - (sptprice * negNofXd1)
+ where
+   logValues  = log( sptprice / strike )
    xPowerTerm = 0.5 * volatility * volatility
    xDen = volatility * sqrt(time)
    xD1  = (((rate + xPowerTerm) * time) + logValues) / xDen
    xD2  = xD1 -  xDen
 
-   nofXd1 = cndf xD1 
-   nofXd2 = cndf xD1    
+   nofXd1 = cndf xD1
+   nofXd2 = cndf xD1
    futureValueX = strike *  exp ( -(rate) * (time) )
 
 --------------------------------------------------------------------------------
@@ -122,7 +122,7 @@ computeSegment granularity t = arr
   arr = U.listArray (0, granularity-1) $
         Prelude.map fn [0 .. granularity-1]
   fn i = let ParameterSet { .. } = data_init U.! ((t+i) `mod` size_init)
-	 in blkSchlsEqEuroNoDiv sptprice strike rate volatility otime otype 0
+         in blkSchlsEqEuroNoDiv sptprice strike rate volatility otime otype 0
 
 --------------------------------------------------------------------------------
 
@@ -134,27 +134,27 @@ main = do args <- getArgs
           -- chunks of what granularity?
           let (numOptions, granularity) =
                case args of 
-  	         []      -> (10000, 1000)
-  	         [b]     -> (10, read b)
-	         [b,n] -> (read n, read b)
+                 []      -> (10000, 1000)
+                 [b]     -> (10, read b)
+                 [b,n] -> (read n, read b)
 
           if granularity > numOptions
-	   then error "Granularity must be smaller than numOptions!!"
-	   else return ()
+           then error "Granularity must be smaller than numOptions!!"
+           else return ()
 
-	  putStrLn$ "Running blackscholes, numOptions "++ show numOptions ++ " and block size " ++ show granularity
+          putStrLn$ "Running blackscholes, numOptions "++ show numOptions ++ " and block size " ++ show granularity
 
           let numChunks = numOptions `quot` granularity
---	      results = runPar$ parMap (computeSegment granularity . (* granularity)) [0..numChunks-1]
+--            results = runPar$ parMap (computeSegment granularity . (* granularity)) [0..numChunks-1]
 
 #if 1
-	      results = runPar$ C.parMap (computeSegment granularity) [0, granularity .. numOptions-1]
+              results = runPar$ C.parMap (computeSegment granularity) [0, granularity .. numOptions-1]
 #else
 -- Not working right yet [2011.02.18]
               results = toList$ runPar$ 
-			parBuild 1 0 (numChunks-1) 
-			  (computeSegment granularity . (* granularity))
+                        parBuild 1 0 (numChunks-1) 
+                          (computeSegment granularity . (* granularity))
 #endif
-	      sum = foldl1' (+) $ map (U.! 0) results
+              sum = foldl1' (+) $ map (U.! 0) results
 
-	  putStrLn$ "Final checksum: "++ show sum
+          putStrLn$ "Final checksum: "++ show sum

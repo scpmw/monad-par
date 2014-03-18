@@ -57,6 +57,8 @@ import Data.Word (Word64)
 
 import qualified Control.Exception as E
 
+import Debug.Trace
+
 import Prelude hiding (null)
 import qualified Prelude
 
@@ -67,7 +69,7 @@ import qualified Prelude
 -- #define DEBUG
 -- [2012.08.30] This shows a 10X improvement on nested parfib:
 -- #define NESTED_SCHEDS
-#define PARPUTS
+-- #define PARPUTS
 -- #define FORKPARENT
 -- #define IDLING_ON
    -- Next, IF idling is on, should we do wakeups?:
@@ -81,7 +83,7 @@ import qualified Prelude
 -- conditionals and trust dead-code-elimination.
 --------------------------------------------------------------------
 
-#ifdef DEBUG
+#ifdef DEBUG2
 import Debug.Trace        (trace)
 import System.Environment (getEnvironment)
 theEnv = unsafePerformIO $ getEnvironment
@@ -188,7 +190,7 @@ popWork Sched{ workpool, no } = do
   mb <- R.tryPopL workpool 
   when dbg $ case mb of 
          Nothing -> return ()
-	 Just _  -> do sn <- makeStableName mb
+	 Just t  -> do sn <- makeStableName t
 	 	       printf " [%d]                                   -> POP work unit %d\n" no (hashStableName sn)
   return mb
 
@@ -301,7 +303,7 @@ runNewSessionAndWait name sched userComp = do
         then tl
         else error$ "Tried to pop the session stack and found we ("++show sid
                    ++") were not on the top! (instead "++show sid2++")"
-               
+
     -- Restore parent task, if any.
     when (not $ isTaskNull ptid) $ do
       dependOnTask ptid ntid
@@ -336,7 +338,7 @@ runParIO userComp = do
    let main_cpu = 0
 #endif
    maybSched <- amINested tid
-   tidorig <- myThreadId -- TODO: remove when done debugging                
+   tidorig <- myThreadId -- TODO: remove when done debugging
    case maybSched of 
      Just (sched) -> do
        -- Here the current thread is ALREADY a worker.  All we need to
@@ -348,18 +350,18 @@ runParIO userComp = do
 
      ------------------------------------------------------------
      -- Non-nested case, make a new set of worker threads:
-     ------------------------------------------------------------       
+     ------------------------------------------------------------
      Nothing -> do
        allscheds <- makeScheds main_cpu
        [Session _ topSessFlag] <- readHotVar$ sessions$ head allscheds
-       
+
        mfin <- newEmptyMVar
        doneFlags <- forM (zip [0..] allscheds) $ \(cpu,sched) -> do
-            workerDone <- newEmptyMVar            
+            workerDone <- newEmptyMVar
             ----------------------------------------
             let wname = ("(worker "++show cpu++" of originator "++show tidorig++")")
 --            forkOn cpu $ do
-            _ <- forkWithExceptions (forkOn cpu) wname $ do                                    
+            _ <- forkWithExceptions (forkOn cpu) wname $ do
             ------------------------------------------------------------STRT WORKER THREAD              
               tid2 <- myThreadId
               registerWorker tid2 sched
@@ -467,7 +469,7 @@ get (IVar vr) =  do
                   io$ startTask tid
                   kont x
 
-#  ifdef DEBUG
+#  ifdef DEBUG2
             sn <- io$ makeStableName vr  -- Should probably do the MutVar inside...
             let resched = trace (" ["++ show (no sch) ++ "]  - Rescheduling on unavailable ivar "++show (hashStableName sn)++"!") 
 #else
@@ -508,11 +510,11 @@ put_ (IVar vr) !content = do
                Empty      -> (Full content tid, [])
                Full _ _   -> error "multiple put"
                Blocked ks -> (Full content tid, ks)
-#ifdef DEBUG
+#ifdef DEBUG2
       when (dbglvl >=  3) $ do 
          sn <- makeStableName vr
-         printf " [%d] Put value %s into IVar %d.  Waking up %d continuations.\n" 
-                (no sched) (show content) (hashStableName sn) (length ks)
+         printf " [%d] Put value ? into IVar %d.  Waking up %d continuations.\n" 
+                (no sched) (hashStableName sn) (length ks)
          return ()
 #endif 
       return ks
@@ -531,7 +533,7 @@ unsafeTryPut (IVar vr) !content = do
 		   Empty      -> (Full content tid, ([], content))
 		   Full x _   -> (e,                ([], x))
 		   Blocked ks -> (Full content tid, (ks, content))
-#ifdef DEBUG
+#ifdef DEBUG2
       sn <- makeStableName vr
       printf " [%d] unsafeTryPut: value %s in IVar %d.  Waking up %d continuations.\n" 
 	     (no sched) (show content) (hashStableName sn) (length (fst pr))
@@ -580,7 +582,7 @@ wakeUp _sched ks arg tid = loop ks
    -- parchain [kont] = kont arg
    -- parchain (kont:rest) = do spawn$ io$ kont arg
    --                           parchain rest
-                              
+
 
 wrapTask :: Task -> Par a -> Par a
 wrapTask tid code = do
@@ -615,16 +617,16 @@ fork task = do
          io$ printf " !!! ERROR: Should never reach this point #1\n"
 
       io$ startTask ptid
-      when dbg$ do 
-       sched2 <- RD.ask 
+      when dbg$ do
+       sched2 <- RD.ask
        io$ printf "  -  called parent continuation... was on worker [%d] now on worker [%d]\n" (no sched) (no sched2)
        return ()
 
     False -> do 
       sch <- RD.ask
       when dbg$ io$ printf " [%d] forking task...\n" (no sch)
-   
       io$ pushWork sch (wrapTask ntid task)
+
 -- This routine "longjmp"s to the scheduler, throwing out its own continuation.
 longjmpSched :: Par a
 -- longjmpSched = Par $ C.ContT rescheduleR
@@ -662,11 +664,11 @@ rescheduleR cnt kont = do
                              when (not empt) $ do
                                printf " [%d %s] - WARNING - leaving rescheduleR while local workpoll is nonempty\n" 
                                       (no mysched) (show tid) 
-                           
+
                            kont (error "Direct.hs: The result value from rescheduleR should not be used.")
                    else do
                      -- when (dbglvl >= 1) $ liftIO $ do
-                     --     tid <- myThreadId                       
+                     --     tid <- myThreadId
                      --     sess <- readSessions mysched
                      --     printf " [%d %s]  -    Apparently NOT finished with head session... trying to steal, all sessions %s\n" 
                      --            (no mysched) (show tid) (show sess)
@@ -761,7 +763,7 @@ errK = error "Error cont: this closure shouldn't be used"
 
 trivialCont :: String -> a -> ROnly ()
 trivialCont str _ = do 
-#ifdef DEBUG
+#ifdef DEBUG2
 --                trace (str ++" trivialCont evaluated!")
                 liftIO$ printf " !! trivialCont evaluated, msg: %s\n" str
 #endif
@@ -778,7 +780,7 @@ trivialCont str _ = do
 {-# INLINE spawn1_ #-}
 -- Spawn a one argument function instead of a thunk.  This is good for debugging if the value supports "Show".
 spawn1_ f x = 
-#ifdef DEBUG
+#ifdef DEBUG2
  do sn  <- io$ makeStableName f
     sch <- RD.ask; when dbg$ io$ printf " [%d] spawning fn %d with arg %s\n" (no sch) (hashStableName sn) (show x)
 #endif
