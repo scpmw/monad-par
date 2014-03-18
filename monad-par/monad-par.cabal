@@ -1,5 +1,5 @@
 Name:                monad-par
-Version:             0.3.4
+Version:             0.3.4.6
 Synopsis:            A library for parallel programming based on a monad
 
 
@@ -18,11 +18,19 @@ Synopsis:            A library for parallel programming based on a monad
 --             *This* package is the original, core monad-par.
 --  0.3.1    : fix for ghc 7.6.1, expose Par.IO
 --  0.3.4    : switch to direct scheduler as default (only 1-level nesting allowed)
+--  0.3.4.1  : fix build with GHC 7.0, and fix test
+--  0.3.4.2  : Bugfix, 0.3.4.1 was released with debugging switches flipped.
+--  0.3.4.3  : Bugfix, Trace scheduler is now the default
+--  0.3.4.4  : Use the Trace scheduler in Control.Monad.Par.IO too
+--  0.3.4.5  : Extremely minor, fix to unit tests.
+--  0.3.4.6  : Add newgeneric flag, supporting the par-classes module.
 
 Description:
   The 'Par' monad offers a simple API for parallel programming.  The
   library works for parallelising both pure and @IO@ computations,
-  although only the pure version is deterministic.
+  although only the pure version is deterministic.  The default 
+  implementation provides a work-stealing scheduler and supports
+  forking tasks that are much lighter weight than IO-threads.
   .
   For complete documentation see "Control.Monad.Par".
   .
@@ -34,7 +42,7 @@ Description:
   * @abstract-par@ provides the type classes that abstract over different
   implementations of the @Par@ monad.
   .
-  * @monad-par-extras@ provides some extra combinators layered on top of
+  * @monad-par-extras@ provides extra combinators and monad transformers layered on top of
   the @Par@ monad.
   .
   Changes in 0.3.4 relative to 0.3:
@@ -59,13 +67,23 @@ extra-source-files:
      tests/AllTests.hs
      tests/AsyncTest.hs
      tests/Makefile
-     tests/ParTests.hs
+     tests/ParTests1.hs
+     tests/ParTests2.hs
+     tests/ParTests_shared.hs
      tests/TestHelpers.hs
      tests/TestParDist.hs
      tests/Test_ContReaderT.hs
      tests/Test_ReaderContT.hs
      tests/hs_cassandra_microbench.hs
      tests/hs_cassandra_microbench2.hs
+
+Flag chaselev
+   Description: Use Chase-Lev Deques for higher-perf work-stealing.
+   Default: False
+
+Flag newgeneric
+   Description: Provide instances for the new par-classes generic Par programming interface.
+   Default: False
 
 Library
   Source-repository head
@@ -94,13 +112,21 @@ Library
                , abstract-par 
                , abstract-deque >= 0.1.4
                -- Extras such as parMap, RNG, State
-               , monad-par-extras == 0.3.*
+               , monad-par-extras >= 0.3
                , deepseq >= 1.1
                , array >= 0.3
                , mwc-random >= 0.11
                , containers
                , parallel >= 3.1
                , mtl >= 2.0.1.0
+
+  if flag(chaselev)
+    cpp-options: -DUSE_CHASELEV
+    build-depends: chaselev-deque
+
+  if flag(newgeneric)
+    cpp-options: -DNEW_GENERIC
+    build-depends: par-classes
 
   ghc-options: -O2
   Other-modules:
@@ -135,14 +161,17 @@ Library
 Test-Suite test-monad-par
     type:       exitcode-stdio-1.0
     main-is:    tests/AllTests.hs
-    ghc-options: -itests -rtsopts -threaded
+    hs-source-dirs: tests/ ./    
+    -- Run tests in parallel:
+    ghc-options: -O2 -threaded -rtsopts -with-rtsopts=-N4    
     build-depends: base >= 4 && < 5
                  , abstract-par, monad-par-extras
                  , array   >= 0.3
                  , deepseq >= 1.2
                  , time
                  , QuickCheck, HUnit
-                 , test-framework-hunit, test-framework-quickcheck2
+                 , test-framework-hunit
+                 , test-framework-quickcheck2 >= 0.3 
                  , test-framework, test-framework-th
 
                  , abstract-deque >= 0.1.4

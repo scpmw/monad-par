@@ -3,6 +3,7 @@
 # fingers are in the habit of typing "make".
 
 # Run "make install" in the parent directory before using the below:
+#================================================================================
 
 ifeq ($(GHC),)
   GHC=`which ghc`
@@ -10,42 +11,65 @@ endif
 ifeq ($(CABAL),)
   CABAL= cabal
 endif
+ifeq ($(CABALDEV),)
+  CABALDEV= cabal-dev
+endif
+
+ifeq ($(SCHED),)
+  SCHED= -ftrace
+endif
+
+
+BENCHES= src/mandel/ src/sorting/ src/nbody/ src/blackscholes/ src/sumeuler/ src/coins/  src/matmult/ \
+  src/parfib/ 
+#  src/queens/ src/minimax/ src/partree/ src/kmeans/  src/randomGen/ src/primes/
+
+# disabling due to dependency hell with deepseq and containers:
+# src/cholesky/ 
+
+#================================================================================
+
+.PHONY: all build gen_cabal runner test install clean deps validate linValidate winValidate tracevers directvers smpvers sparksvers allvers winhelper
 
 all: test
 
-install: monad-par-examples.cabal
-	$(CABAL) install --prefix=`pwd`
+# Get everything ready to test/benchmark, but don't do it:
+build: gen_cabal deps runner
+
+install: gen_cabal
+	$(CABAL) install -j $(SCHED) --prefix=`pwd` $(BENCHES) $(CABAL_ARGS)
 
 clean:
-	rm -rf bin *.hi *.o *.exe
+	rm -rf bin *.hi *.o *.exe .cabal-sandbox/ src/*/bin
+	find -name "cabal.sandbox.config" | xargs rm -f
 	$(CABAL) clean || echo 
-
-distclean: clean
-	rm -f benchmark.run
 
 # This is a quick test that assumes dependencies are already there.
 # TODO -- should probably merge this with 'validate'.
 # But right now it's SOO much faster than using cabal that it's nice to have around:
-test: benchmark.run deps
-        # Building with no cabal should put the same executables in the same
-        # places as building with cabal:
-	SHORTRUN=1 THREADS="1" ./benchmark.run --par --no-cabal +RTS -N
+test: deps runner
+	./run_benchmark
 
-benchmark.run: benchmark.hs
-	ghc -rtsopts -threaded --make benchmark.hs -o benchmark.run
+runner: dist/build/run_benchmark/run_benchmark
+dist/build/run_benchmark/run_benchmark: run_benchmark.hs run_benchmark.cabal
+	$(CABAL) install --only-dependencies -j 
+	$(CABAL) build
 
-monad-par-examples.cabal:
+sandbox:
+	cabal sandbox init
+	for f in $(BENCHES); do (cd $$f; cabal sandbox init --sandbox ../../.cabal-sandbox) done
+
+gen_cabal:
 	./generate_cabal.sh
 
-deps: monad-par-examples.cabal
-	$(CABAL) install --only-dependencies
-
+deps: gen_cabal
+	$(MAKE) install CABAL_ARGS="--only-dependencies --disable-library-profiling --disable-documentation -j --max-backjumps=1000"
 
 #================================================================================
 # Validation / regression testing:
 
 # "Validation" uses cabal-dev for isolation:
-CBLDEV=	cabal-dev install -s $(MAINDEVDIR)
+CBLDEV=$(CABALDEV) -s $(MAINDEVDIR)
 BIN="../cabal-dev/bin/"
 
 # BAD way to check for Windows:
@@ -57,7 +81,7 @@ else
   MAINDEVDIR=..\\cabal-dev
 endif
 
-validate: monad-par-examples.cabal deps
+validate: gen_cabal
 	$(MAKE) $(BUILDCMD)
 
 # This is just like a regular test but with cabal-dev.
@@ -65,9 +89,9 @@ validate: monad-par-examples.cabal deps
 #	$(MAKE) CABAL=$(CBLDEV) test
 
 # OR... we could build through cabal and forgo parallelism:
-linValidate: benchmark.run monad-par-examples.cabal
-	$(MAKE) CABAL=$(CBLDEV) deps
-	SHORTRUN=1 THREADS="1" ./benchmark.run 
+linValidate: gen_cabal
+	$(MAKE) CABAL="$(CBLDEV)" deps
+	SHORTRUN=1 THREADS="1" $(HSBENCHER) --with-cabal-install="$(CBLDEV)" --with-ghc="$(GHC)"
 
 # --------------------------------------------------
 # Hacks to build on Windows:
@@ -82,24 +106,19 @@ winValidate: allvers
         # No way to run Sparks version with this little hack.
 
 tracevers:
-	$(CBLDEV) -ftrace    --program-suffix=_Trace_threaded.exe 
+	$(CBLDEV) install --flags="-ftrace"    --program-suffix=_Trace_threaded.exe 
 
 directvers:
-	$(CBLDEV) -fdirect   --program-suffix=_Direct_threaded.exe 
+	$(CBLDEV) install  --flags="-fdirect"   --program-suffix=_Direct_threaded.exe 
 
 smpvers:
-	$(CBLDEV) -fmeta-smp --program-suffix=_SMP_threaded.exe 
+	$(CBLDEV) install  --flags="-fmeta-smp" --program-suffix=_SMP_threaded.exe 
 
 sparksvers:
-	$(CBLDEV) -fsparks   --program-suffix=_Sparks_threaded.exe 
+	$(CBLDEV) install  --flags="-fsparks"   --program-suffix=_Sparks_threaded.exe 
 
 # Should be able to get make -j parallelism here:
 allvers: tracevers directvers smpvers sparksvers
-
-# temphack:
-# 	./generate_cabal.sh
-# 	$(CBLDEV) --only-dependencies
-# 	$(MAKE) -j allvers
 
 
 # TEMP: A cheap way to run everything for a quick test without having to

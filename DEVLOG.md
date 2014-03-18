@@ -621,11 +621,209 @@ Also, don't forget to list "OtherModules" to avoid this:
 
 
 
+[2013.05] {Simon Marlow's Notes about possible nested implementation}
+---------------------------------------------------------------------
+
+Problem scenarios:
+
+runPar $ do
+  let x = runPar $ ...
+  fork (.. x ..)
+  .. x ..
+
+In "let x = runPar $ ...", while the runPar is executing, x is a
+blackhole.  We must ensure that there is a thread making progress on x
+at all times, otherwise we may get a deadlock, because other siblings
+of this computation may depend on x.
+
+So, the thread that evaluates runPar gains a new constraint: it can
+only work on stuff below this runPar.  The other workers can continue
+to work on any work items they like.
+
+How do we know what is "below this runPar"?  A linear depth measure
+won't do, because there might be a tree of runPars.  The easy solution
+is just to assign each runPar a UID, and say that the leader can only
+work on items from this UID.
+
+In general, we have a forest of runPars:
+
+           A       F
+          / \     / \
+         B   C   G   H
+        / \
+       D   E
+
+Where A gave rise to B and C, B gave rise to D and E.  F was a
+completely separate runPar called by a different thread.
+
+The worker that starts on A can work on anything from [A-E], but not
+[F-H].  All of [A-E] are required by A.  Similarly the leader for B
+can only work on [B,D,E], and the leader for F can only work on
+[F,G,H].
+
+Should the leader for A only work on A itself?  That would be bad,
+because A might run out of work while all the action is in its
+children, and we want to be able to use all our cores there.
+
+
+We want to have a fixed number of workers at all times.  So we have a
+fixed number of Scheds:
+
+data Sched = Sched
+    { no       :: Int,
+      thread   :: ThreadId,
+      workpool :: IORef (Map UID [Trace]),
+      idle     :: IORef [MVar Bool],
+      scheds   :: [Sched] -- Global list of all per-thread workers.
+    }
+
+We need a global containing the current UID.
+
+When stealing, if the current worker is a leader, it steals only from
+its UID.  Otherwise, it can steal from any UID.
+
+When a thread enters runPar, either:
+
+  - it is already a worker, in which case we want to create a new UID
+    for this runPar, and dive directly into the scheduler, as a leader
+    on this UID.
+
+  - it is not a worker. What do we do here?  Can we hand off to one of
+    the existing workers?  But then the target worker must become a
+    leader.  What if it was already a leader? Then we can't hand off
+    to it, because it has an important job to do.
+
+    Plan:
+      - grab a new UID for this runPar
+      - make an MVar to hold the result
+      - make a work item containing the whole runPar, that puts its result
+        in the MVar when done
+      - put the work item on one of the work queues.
+      - wait on the MVar.
+
+    A leader won't take it up, because it is a different UID.  As soon
+    as there are free resources it will be executed, and will
+    eventually wake up the original thread that called runPar.
+
+
+
+[2013.09.16] {Finishing overhaul of benchmarks for HSBencher}
+--------------------------------------------------------------------------------
+
+
+      Compiling Config 23 of 40:  (args "") confID 
+	   "src_matmult_disabledocumentation_disablelibraryprofiling_disableexecutableprofiling_ftrace"
+
+     [hsbencher] Found 1 methods that can handle src/matmult/: ["cabal"]
+     [cabalMethod]  Switched to src/matmult/, clearing binary target dir... 
+     * Executing command: rm -rf ./bin/*
+     * Command completed with 0 lines of output.
+     [cabalMethod] Running cabal command: cabal install --bindir=./bin/ ./ --program-suffix=_src_matmult_disabledocumentation_disablelibraryprofiling_disableexecutableprofiling_ftrace --disable-documentation --disable-library-profiling --disable-executable-profiling -ftrace
+     * Executing command: cabal install --bindir=./bin/ ./ --program-suffix=_src_matmult_disabledocumentation_disablelibraryprofiling_disableexecutableprofiling_ftrace --disable-documentation --disable-library-profiling --disable-executable-profiling -ftrace
+     [cabal] Resolving dependencies...
+     [cabal] Configuring matmult-0.3.1...
+     [cabal] Building matmult-0.3.1...
+     [cabal] Preprocessing executable 'monad-par-test-matmult' for matmult-0.3.1...
+     [cabal] [stderr] cabal: can't find source for matmult in .
+     [cabal] Failed to install matmult-0.3.1
+     [cabal] [stderr] cabal: Error: some packages failed to install:
+     [cabal] [stderr] matmult-0.3.1 failed during the building phase. The exception was:
+     [cabal] [stderr] ExitFailure 1
+     [cabal] 
+     [cabal] [stderr] 
+     * Command completed with 11 lines of output.
+    run_benchmark: expected this command to succeed! But it exited with code 1:
+      cabal install --bindir=./bin/ ./ --program-suffix=_src_matmult_disabledocumentation_disablelibraryprofiling_disableexecutableprofiling_ftrace --disable-documentation --disable-library-profiling --disable-executable-profiling -ftrace
+
+
+[2013.11.21] {Examining fusion table benchmark data}
+------------------------------------------------------------
+
+Looking through this data yields some interesting discrepancies.
+For example, just narrowing to th eruns on 2013-05-28:
+
+  * coins - all 3 (direct,trace,sparks) track closely and are fine
+  * nbody, blackscholes, mandel, sumeuler - ditto
+  * mergesort - missing some data, what's there looks fine.
+  * MatMult - Direct/Trace are fine, but Sparks falls apart.
+
+Oh, was matmult the weird one that was written with unsafePerformIO,
+or no, that was cholesky?
+
+Much later on, 2013-11-14, 
+
+  * runID d007_1384410470 looks suspicious for sparks/coins.
+ 
+[2013.11.12] {Found a nondeterministic failure in sorting after switching to LVish}
+-----------------------------------------------------------------------------------
+
+Namely this:
+
+    monad-par-test-mergesort: thread blocked indefinitely in an MVar operation
+
+Running 2^23 through on my laptop gives this behavior with lvish -N4:
+
+    SELFTIMED 1.799088
+      12,471,040,200 bytes allocated in the heap
+	  18,856,984 bytes copied during GC
+	 331,762,496 bytes maximum residency (21 sample(s))
+	 113,264,520 bytes maximum slop       
+       
+Maximum residency goes up with parallelism substantially.
+Here's the same thing running with the trace scheduler (-N4):
+
+    SELFTIMED 0.846114
+       5,539,016,888 bytes allocated in the heap
+	  14,921,576 bytes copied during GC
+	 100,744,416 bytes maximum residency (30 sample(s))
+	  42,264,096 bytes maximum slop
+		 258 MB total memory in use (27 MB lost due to fragmentation)
+
+Egad!  And -N1 for trace has much similar maximum residency:
+
+    SELFTIMED 2.111836
+       5,538,817,120 bytes allocated in the heap
+	  16,573,512 bytes copied during GC
+	  96,322,080 bytes maximum residency (29 sample(s))
+	  40,677,680 bytes maximum slop
+
+
+[2013.11.13] {Testing -A20 systematically}
+----------------------------------
+
+This is build #62 where we're turning on -A20M:
+
+  http://tester-lin.soic.indiana.edu:8080/view/Benchmark/job/Benchmark_monad-par_Delta/62/
+
+I added that option, which now shows up in the RUNTIME_FLAGS column.
+I'm comparing these run IDs:
+
+    hive_1384348805 (-A20M)
+    hive_1384289972 (default 512K nursery)
+
+The -A20M does this on trace/parfib(33):
+
+   http://goo.gl/6zIQ7w   
+
+It's pretty bad.  Both high variance and not smoothly speeding up
+(jags).  But that's just parfib on a four socket machine.
+
+And then here's the default one.. It's also pretty bad.  Flat but
+zaggy, hovering around the 3 second line:
+
+   http://goo.gl/M8ho2t
+
+But the MINIMUM doesn't go as low as -A20M, and it's USUALLY worse
+than the -A20M version.
+
+
 
 
 
 TEMP / SCRAP:
 --------------------------------------------------------------------------------
+
+
 
 
 
